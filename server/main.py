@@ -33,28 +33,52 @@ MEMGRAPH_PASSWORD = os.environ.get("MEMGRAPH_PASSWORD", "mem0graph")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/app/history/history.db")
 
+# DEFAULT_CONFIG = {
+#     "version": "v1.1",
+#     "vector_store": {
+#         "provider": "pgvector",
+#         "config": {
+#             "host": POSTGRES_HOST,
+#             "port": int(POSTGRES_PORT),
+#             "dbname": POSTGRES_DB,
+#             "user": POSTGRES_USER,
+#             "password": POSTGRES_PASSWORD,
+#             "collection_name": POSTGRES_COLLECTION_NAME,
+#         },
+#     },
+#     "graph_store": {
+#         "provider": "neo4j",
+#         "config": {"url": NEO4J_URI, "username": NEO4J_USERNAME, "password": NEO4J_PASSWORD},
+#     },
+#     "llm": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": "gpt-4o"}},
+#     "embedder": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "model": "text-embedding-3-small"}},
+#     "history_db_path": HISTORY_DB_PATH,
+# }
 DEFAULT_CONFIG = {
-    "version": "v1.1",
-    "vector_store": {
-        "provider": "pgvector",
+    "llm": {
+        "provider": "deepseek",
         "config": {
-            "host": POSTGRES_HOST,
-            "port": int(POSTGRES_PORT),
-            "dbname": POSTGRES_DB,
-            "user": POSTGRES_USER,
-            "password": POSTGRES_PASSWORD,
-            "collection_name": POSTGRES_COLLECTION_NAME,
-        },
+            "model": "deepseek-chat",  
+            "temperature": 0.2,
+        }
     },
-    "graph_store": {
-        "provider": "neo4j",
-        "config": {"url": NEO4J_URI, "username": NEO4J_USERNAME, "password": NEO4J_PASSWORD},
+    "embedder": {
+        "provider": "openai",
+        "config": {
+            # Provider-specific settings go here
+            "model": "text-embedding-v4",
+            "openai_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"  # Optional custom base URL
+        }
     },
-    "llm": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": "gpt-4o"}},
-    "embedder": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "model": "text-embedding-3-small"}},
-    "history_db_path": HISTORY_DB_PATH,
+    "vector_store": {
+        "provider": "qdrant",
+        "config": {
+            "collection_name": "test",
+            "host": "localhost",
+            "port": 6333,
+        }
+    }
 }
-
 
 MEMORY_INSTANCE = Memory.from_config(DEFAULT_CONFIG)
 
