@@ -2,6 +2,7 @@ import argparse
 import os
 
 # from src.langmem import LangMemManager
+from src.full_context import FullContextProcessor
 from src.memzero.add import MemoryADD
 from src.memzero.search import MemorySearch
 # from src.openai.predict import OpenAIPredict
@@ -47,6 +48,10 @@ def main():
             )
             memory_searcher = MemorySearch(output_file_path, args.top_k, args.filter_memories, args.is_graph)
             memory_searcher.process_data_file("dataset/locomo10.json")
+    elif args.technique_type == "full_context":
+        output_file_path = os.path.join(args.output_folder, "full_context_results.json")
+        full_context_processor = FullContextProcessor(data_path="dataset/locomo10.json")
+        full_context_processor.process_all_conversations(output_file_path)
     elif args.technique_type == "rag":
         output_file_path = os.path.join(args.output_folder, f"rag_results_{args.chunk_size}_k{args.num_chunks}.json")
         rag_manager = RAGManager(data_path="dataset/locomo10_rag.json", chunk_size=args.chunk_size, k=args.num_chunks)
