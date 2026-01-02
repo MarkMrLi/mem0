@@ -24,7 +24,7 @@ load_dotenv()
 # 类别映射表
 CATEGORY_MAPPING = {
     "1": "multi-hop",
-    "2": "", 
+    "2": "temporal",     # 修正：将空字符串改为 "temporal"
     "3": "open-domain",
     "4": "single-hop",
     "5": "adversarial"
@@ -66,23 +66,23 @@ def process_item(item_data):
 def run_evaluation(data_file, output_folder, top_k=30, filter_memories=False, is_graph=False, max_workers=10):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment_name = f"mem0_eval_top{top_k}_filter{filter_memories}_graph{is_graph}_{timestamp}"
-    experiment_dir = os.path.join(output_folder, experiment_name)
+    experiment_dir = os.path.join("/home/suma2/repo/mem0/evaluation/results/mem0_eval_top30_filterFalse_graphFalse_20260102_143036")
     os.makedirs(experiment_dir, exist_ok=True)
 
     print(f"🚀 开始完整的mem0评估流程")
     print(f"📁 实验结果将保存到: {experiment_dir}")
 
     # Step 1: 运行搜索
-    print(f"\n🔍 Step 1: 运行记忆搜索...")
+    # print(f"\n🔍 Step 1: 运行记忆搜索...")
     search_results_file = os.path.join(experiment_dir, "search_results.json")
-    memory_searcher = MemorySearch(
-        output_path=search_results_file,
-        top_k=top_k,
-        filter_memories=filter_memories,
-        is_graph=is_graph
-    )
-    memory_searcher.process_data_file(data_file)
-    print(f"✅ 搜索完成")
+    # memory_searcher = MemorySearch(
+    #     output_path=search_results_file,
+    #     top_k=top_k,
+    #     filter_memories=filter_memories,
+    #     is_graph=is_graph
+    # )
+    # memory_searcher.process_data_file(data_file)
+    # print(f"✅ 搜索完成")
 
     # Step 2: 运行评估
     print(f"\n📊 Step 2: 生成评估指标...")

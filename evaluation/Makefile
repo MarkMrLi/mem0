@@ -1,5 +1,12 @@
 
-# Run the experiments
+# Mem0 evaluation - 完整流程（推荐）
+run-mem0-eval:
+	python run_mem0_evaluation.py --data_file dataset/locomo10.json --output_folder results/ --top_k 30
+
+run-mem0-eval-graph:
+	python run_mem0_evaluation.py --data_file dataset/locomo10.json --output_folder results/ --top_k 30 --is_graph
+
+# 传统的分步执行（保留向后兼容）
 run-mem0-add:
 	python run_experiments.py --technique_type mem0 --method add
 

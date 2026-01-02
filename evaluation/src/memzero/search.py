@@ -2,58 +2,62 @@ import json
 import os
 import requests
 import time
-import threading
+import threading # 增加：为了多线程安全
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 from jinja2 import Template
 from openai import OpenAI
+from prompts import ANSWER_PROMPT, ANSWER_PROMPT_GRAPH
 from tqdm import tqdm
-
-# 假设这些是从你的 prompts.py 导入的
-# from prompts import ANSWER_PROMPT, ANSWER_PROMPT_GRAPH
 
 load_dotenv()
 
+
 class MemorySearch:
-    def __init__(self, output_path="results.jsonl", top_k=10, filter_memories=False, is_graph=False):
+    def __init__(self, output_path="results.json", top_k=10, filter_memories=False, is_graph=False):
         self.base_url = os.getenv("MEM0_BASE_URL", "http://127.0.0.1:7000")
         self.top_k = top_k
-        self.openai_client = OpenAI(
-            base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1"),
-            api_key=os.getenv("OPENAI_API_KEY", "no-key")
-        )
+        self.openai_client = OpenAI(base_url="http://localhost:8000/v1")
+        self.results = defaultdict(list)
         self.output_path = output_path
         self.filter_memories = filter_memories
         self.is_graph = is_graph
-        
-        # 使用锁来保证多线程写入文件时的安全
-        self.file_lock = threading.Lock()
-        
-        # 结果缓存（如果仍需要在内存中保留一份）
-        self.results = defaultdict(list)
+        self.lock = threading.Lock() # 增加：防止多线程同时写文件导致损坏
 
-        # 这里的提示词逻辑，实际运行时请确保 prompts 已正确导入
-        try:
-            from prompts import ANSWER_PROMPT, ANSWER_PROMPT_GRAPH
-            self.ANSWER_PROMPT_TEMPLATE = ANSWER_PROMPT_GRAPH if self.is_graph else ANSWER_PROMPT
-        except ImportError:
-            self.ANSWER_PROMPT_TEMPLATE = "Question: {{question}}" # 降级处理
+        if self.is_graph:
+            self.ANSWER_PROMPT = ANSWER_PROMPT_GRAPH
+        else:
+            self.ANSWER_PROMPT = ANSWER_PROMPT
+
+    # 增加一个辅助方法，修复原代码中 json.(...) 的语法错误并集中管理写入
+    def _save_to_disk(self):
+        with self.lock:
+            with open(self.output_path, "w", encoding="utf-8") as f:
+                json.dump(self.results, f, indent=4, ensure_ascii=False)
 
     def search_memory(self, user_id, query, max_retries=3, retry_delay=1):
         start_time = time.time()
         retries = 0
         while retries < max_retries:
             try:
-                data = {
-                    "query": query,
-                    "user_id": user_id,
-                    "top_k": self.top_k,
-                    "filter_memories": self.filter_memories
-                }
                 if self.is_graph:
-                    data.update({"enable_graph": True, "output_format": "v1.1"})
+                    data = {
+                        "query": query,
+                        "user_id": user_id,
+                        "top_k": self.top_k,
+                        "filter_memories": self.filter_memories,
+                        "enable_graph": True,
+                        "output_format": "v1.1"
+                    }
+                else:
+                    data = {
+                        "query": query,
+                        "user_id": user_id,
+                        "top_k": self.top_k,
+                        "filter_memories": self.filter_memories
+                    }
 
                 response = requests.post(f"{self.base_url}/search", json=data, timeout=300)
                 response.raise_for_status()
@@ -62,129 +66,134 @@ class MemorySearch:
             except Exception as e:
                 retries += 1
                 if retries >= max_retries:
-                    print(f"Search failed after {max_retries} retries for user {user_id}: {e}")
-                    return [], [] if self.is_graph else None, time.time() - start_time
+                    raise e
                 time.sleep(retry_delay)
 
         end_time = time.time()
         
-        # 解析 Semantic Memories
-        results_list = memories.get("results", [])
+        # 统一处理 results 字段，防止 Key 错误
+        results_data = memories.get("results", [])
         semantic_memories = [
             {
-                "memory": m["memory"],
-                "timestamp": m.get("metadata", {}).get("timestamp", "N/A"),
-                "score": round(m.get("score", 0), 2),
+                "memory": memory["memory"],
+                "timestamp": memory.get("metadata", {}).get("timestamp", ""),
+                "score": round(memory["score"], 2),
             }
-            for m in results_list
+            for memory in results_data
         ]
-
-        # 解析 Graph Memories
+        
         graph_memories = None
         if self.is_graph:
             graph_memories = [
-                {"source": r["source"], "relationship": r["relationship"], "target": r["target"]}
-                for r in memories.get("relations", [])
+                {"source": relation["source"], "relationship": relation["relationship"], "target": relation["target"]}
+                for relation in memories.get("relations", [])
             ]
             
         return semantic_memories, graph_memories, end_time - start_time
 
-    def answer_question(self, speaker_1_user_id, speaker_2_user_id, question):
-        # 并发获取两个用户的记忆可以进一步优化性能，这里保持逻辑清晰
-        s1_mem, s1_graph, s1_time = self.search_memory(speaker_1_user_id, question)
-        s2_mem, s2_graph, s2_time = self.search_memory(speaker_2_user_id, question)
+    def answer_question(self, speaker_1_user_id, speaker_2_user_id, question, answer, category):
+        speaker_1_memories, speaker_1_graph_memories, speaker_1_memory_time = self.search_memory(
+            speaker_1_user_id, question
+        )
+        speaker_2_memories, speaker_2_graph_memories, speaker_2_memory_time = self.search_memory(
+            speaker_2_user_id, question
+        )
 
-        search_1_text = [f"{item['timestamp']}: {item['memory']}" for item in s1_mem]
-        search_2_text = [f"{item['timestamp']}: {item['memory']}" for item in s2_mem]
+        search_1_memory = [f"{item['timestamp']}: {item['memory']}" for item in speaker_1_memories]
+        search_2_memory = [f"{item['timestamp']}: {item['memory']}" for item in speaker_2_memories]
 
-        template = Template(self.ANSWER_PROMPT_TEMPLATE)
+        template = Template(self.ANSWER_PROMPT)
         answer_prompt = template.render(
             speaker_1_user_id=speaker_1_user_id.split("_")[0],
             speaker_2_user_id=speaker_2_user_id.split("_")[0],
-            speaker_1_memories=json.dumps(search_1_text, indent=4, ensure_ascii=False),
-            speaker_2_memories=json.dumps(search_2_text, indent=4, ensure_ascii=False),
-            speaker_1_graph_memories=json.dumps(s1_graph, indent=4, ensure_ascii=False) if s1_graph else "[]",
-            speaker_2_graph_memories=json.dumps(s2_graph, indent=4, ensure_ascii=False) if s2_graph else "[]",
+            speaker_1_memories=json.dumps(search_1_memory, indent=4),
+            speaker_2_memories=json.dumps(search_2_memory, indent=4),
+            speaker_1_graph_memories=json.dumps(speaker_1_graph_memories, indent=4),
+            speaker_2_graph_memories=json.dumps(speaker_2_graph_memories, indent=4),
             question=question,
         )
 
         t1 = time.time()
         response = self.openai_client.chat.completions.create(
-            model=os.getenv("MODEL", "gpt-4"),
-            messages=[{"role": "system", "content": answer_prompt}],
-            temperature=0.0
+            model=os.getenv("MODEL"), messages=[{"role": "system", "content": answer_prompt}], temperature=0.0
         )
         response_time = time.time() - t1
-        
         return (
             response.choices[0].message.content,
-            s1_mem, s2_mem, s1_time, s2_time,
-            s1_graph, s2_graph, response_time
+            speaker_1_memories,
+            speaker_2_memories,
+            speaker_1_memory_time,
+            speaker_2_memory_time,
+            speaker_1_graph_memories,
+            speaker_2_graph_memories,
+            response_time,
         )
 
-    def _save_result_to_file(self, result):
-        """线程安全的单条结果写入 (JSONL 格式)"""
-        with self.file_lock:
-            with open(self.output_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(result, ensure_ascii=False) + "\n")
-
-    def process_question(self, val, speaker_a_user_id, speaker_b_user_id, conv_idx):
+    def process_question(self, val, speaker_a_user_id, speaker_b_user_id):
         question = val.get("question", "")
-        
+        answer = val.get("answer", "")
+        category = val.get("category", -1)
+        evidence = val.get("evidence", [])
+        adversarial_answer = val.get("adversarial_answer", "")
+
         (
-            response, s1_mem, s2_mem, 
-            s1_time, s2_time, s1_graph, s2_graph, 
-            resp_time
-        ) = self.answer_question(speaker_a_user_id, speaker_b_user_id, question)
+            response,
+            speaker_1_memories,
+            speaker_2_memories,
+            speaker_1_memory_time,
+            speaker_2_memory_time,
+            speaker_1_graph_memories,
+            speaker_2_graph_memories,
+            response_time,
+        ) = self.answer_question(speaker_a_user_id, speaker_b_user_id, question, answer, category)
 
         result = {
-            "conv_idx": conv_idx,
             "question": question,
-            "answer": val.get("answer", ""),
-            "category": val.get("category", -1),
-            "evidence": val.get("evidence", []),
+            "answer": answer,
+            "category": category,
+            "evidence": evidence,
             "response": response,
-            "adversarial_answer": val.get("adversarial_answer", ""),
-            "speaker_1_memories": s1_mem,
-            "speaker_2_memories": s2_mem,
-            "speaker_1_memory_time": s1_time,
-            "speaker_2_memory_time": s2_time,
-            "speaker_1_graph_memories": s1_graph,
-            "speaker_2_graph_memories": s2_graph,
-            "response_time": resp_time,
+            "adversarial_answer": adversarial_answer,
+            "speaker_1_memories": speaker_1_memories,
+            "speaker_2_memories": speaker_2_memories,
+            "num_speaker_1_memories": len(speaker_1_memories),
+            "num_speaker_2_memories": len(speaker_2_memories),
+            "speaker_1_memory_time": speaker_1_memory_time,
+            "speaker_2_memory_time": speaker_2_memory_time,
+            "speaker_1_graph_memories": speaker_1_graph_memories,
+            "speaker_2_graph_memories": speaker_2_graph_memories,
+            "response_time": response_time,
         }
-
-        # 即时写入磁盘，不再全量重写 self.results
-        self._save_result_to_file(result)
+        
+        # 删除了这里的磁盘写入，改为在 process_data_file 级别控制
         return result
 
-    def process_data_file(self, file_path, max_workers=5):
-        with open(file_path, "r", encoding="utf-8") as f:
+    def process_data_file(self, file_path):
+        with open(file_path, "r") as f:
             data = json.load(f)
 
         for idx, item in tqdm(enumerate(data), total=len(data), desc="Processing conversations"):
-            qa_list = item["qa"]
-            conv = item["conversation"]
-            speaker_a_id = f"{conv['speaker_a']}_{idx}"
-            speaker_b_id = f"{conv['speaker_b']}_{idx}"
+            qa = item["qa"]
+            conversation = item["conversation"]
+            speaker_a_user_id = f"{conversation['speaker_a']}_{idx}"
+            speaker_b_user_id = f"{conversation['speaker_b']}_{idx}"
 
-            # 使用多线程处理当前对话下的所有问题
-            self.process_questions_parallel(qa_list, speaker_a_id, speaker_b_id, idx, max_workers)
+            for question_item in qa:
+                result = self.process_question(question_item, speaker_a_user_id, speaker_b_user_id)
+                self.results[idx].append(result)
 
-    def process_questions_parallel(self, qa_list, speaker_a_id, speaker_b_id, conv_idx, max_workers):
+            # 修改点：处理完一整个对话后保存一次，而不是每个问题保存一次
+            self._save_to_disk()
+
+    def process_questions_parallel(self, qa_list, speaker_a_user_id, speaker_b_user_id, max_workers=1):
+        def process_single_question(val):
+            return self.process_question(val, speaker_a_user_id, speaker_b_user_id)
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # 使用 list 强行触发 map 的执行
-            list(tqdm(
-                executor.map(
-                    lambda q: self.process_question(q, speaker_a_id, speaker_b_id, conv_idx), 
-                    qa_list
-                ),
-                total=len(qa_list),
-                desc=f"Conv {conv_idx}",
-                leave=False
-            ))
-
-if __name__ == "__main__":
-    # 使用示例
-    searcher = MemorySearch(output_path="eval_results.jsonl", is_graph=True)
-    # searcher.process_data_file("input_data.json", max_workers=10)
+            # map 后批量获取结果
+            qa_results = list(tqdm(executor.map(process_single_question, qa_list), total=len(qa_list), desc="Answering Questions"))
+            
+        # 并行处理完毕后统一写入
+        # 注意：这里需要外部逻辑调用 self.results[idx].extend(qa_results) 或自行处理
+        self._save_to_disk()
+        return qa_results
