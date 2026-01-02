@@ -19,7 +19,7 @@ class MemorySearch:
     def __init__(self, output_path="results.json", top_k=10, filter_memories=False, is_graph=False):
         self.base_url = os.getenv("MEM0_BASE_URL", "http://127.0.0.1:7000")
         self.top_k = top_k
-        self.openai_client = OpenAI(base_url="http://localhost:8000/v1")
+        self.openai_client = OpenAI(base_url=os.getenv("VLLM_BASE_URL"))
         self.results = defaultdict(list)
         self.output_path = output_path
         self.filter_memories = filter_memories

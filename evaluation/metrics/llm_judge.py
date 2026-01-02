@@ -9,7 +9,7 @@ from mem0.memory.utils import extract_json
 import os
 from dotenv import load_dotenv
 load_dotenv()
-client = OpenAI(base_url="http://localhost:8000/v1")
+client = OpenAI(base_url=os.getenv("VLLM_BASE_URL"))
 
 ACCURACY_PROMPT = """
 Your task is to label an answer to a question as ’CORRECT’ or ’WRONG’. You will be given the following data:
