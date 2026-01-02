@@ -1,5 +1,6 @@
 import json
 import os
+import requests
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -10,20 +11,14 @@ from openai import OpenAI
 from prompts import ANSWER_PROMPT, ANSWER_PROMPT_GRAPH
 from tqdm import tqdm
 
-from mem0 import MemoryClient
-
 load_dotenv()
 
 
 class MemorySearch:
     def __init__(self, output_path="results.json", top_k=10, filter_memories=False, is_graph=False):
-        self.mem0_client = MemoryClient(
-            api_key=os.getenv("MEM0_API_KEY"),
-            org_id=os.getenv("MEM0_ORGANIZATION_ID"),
-            project_id=os.getenv("MEM0_PROJECT_ID"),
-        )
+        self.base_url = os.getenv("MEM0_BASE_URL", "http://127.0.0.1:7000")
         self.top_k = top_k
-        self.openai_client = OpenAI()
+        self.openai_client = OpenAI(base_url="http://localhost:8000/v1")
         self.results = defaultdict(list)
         self.output_path = output_path
         self.filter_memories = filter_memories
@@ -41,18 +36,25 @@ class MemorySearch:
             try:
                 if self.is_graph:
                     print("Searching with graph")
-                    memories = self.mem0_client.search(
-                        query,
-                        user_id=user_id,
-                        top_k=self.top_k,
-                        filter_memories=self.filter_memories,
-                        enable_graph=True,
-                        output_format="v1.1",
-                    )
+                    data = {
+                        "query": query,
+                        "user_id": user_id,
+                        "top_k": self.top_k,
+                        "filter_memories": self.filter_memories,
+                        "enable_graph": True,
+                        "output_format": "v1.1"
+                    }
                 else:
-                    memories = self.mem0_client.search(
-                        query, user_id=user_id, top_k=self.top_k, filter_memories=self.filter_memories
-                    )
+                    data = {
+                        "query": query,
+                        "user_id": user_id,
+                        "top_k": self.top_k,
+                        "filter_memories": self.filter_memories
+                    }
+
+                response = requests.post(f"{self.base_url}/search", json=data, timeout=300)
+                response.raise_for_status()
+                memories = response.json()
                 break
             except Exception as e:
                 print("Retrying...")
@@ -69,7 +71,7 @@ class MemorySearch:
                     "timestamp": memory["metadata"]["timestamp"],
                     "score": round(memory["score"], 2),
                 }
-                for memory in memories
+                for memory in memories["results"]
             ]
             graph_memories = None
         else:

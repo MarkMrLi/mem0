@@ -1,13 +1,9 @@
 import json
 import os
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
-
+import asyncio
+import httpx
+from tqdm.asyncio import tqdm
 from dotenv import load_dotenv
-from tqdm import tqdm
-
-from mem0 import MemoryClient
 
 load_dotenv()
 
@@ -44,13 +40,7 @@ Generate personal memories that follow these guidelines:
 
 class MemoryADD:
     def __init__(self, data_path=None, batch_size=2, is_graph=False):
-        self.mem0_client = MemoryClient(
-            api_key=os.getenv("MEM0_API_KEY"),
-            org_id=os.getenv("MEM0_ORGANIZATION_ID"),
-            project_id=os.getenv("MEM0_PROJECT_ID"),
-        )
-
-        self.mem0_client.update_project(custom_instructions=custom_instructions)
+        self.base_url = os.getenv("MEM0_BASE_URL", "http://127.0.0.1:7000")
         self.batch_size = batch_size
         self.data_path = data_path
         self.data = None
@@ -63,79 +53,85 @@ class MemoryADD:
             self.data = json.load(f)
         return self.data
 
-    def add_memory(self, user_id, message, metadata, retries=3):
-        for attempt in range(retries):
-            try:
-                _ = self.mem0_client.add(
-                    message, user_id=user_id, version="v2", metadata=metadata, enable_graph=self.is_graph
-                )
-                return
-            except Exception as e:
-                if attempt < retries - 1:
-                    time.sleep(1)  # Wait before retrying
+    async def _async_add_single(self, client, user_id, message, metadata, semaphore, retries=3):
+        """核心异步请求函数：使用信号量控制真正的并发数"""
+        async with semaphore:
+            data = {
+                "messages": message if isinstance(message, list) else [message],
+                "user_id": user_id,
+                "metadata": metadata
+            }
+            for attempt in range(retries):
+                try:
+                    # 注意：由于新版服务端要做 Fact Extraction，timeout 必须给够
+                    response = await client.post(
+                        f"{self.base_url}/memories", 
+                        json=data, 
+                        timeout=300.0
+                    )
+                    response.raise_for_status()
+                    return True
+                except Exception as e:
+                    if attempt < retries - 1:
+                        await asyncio.sleep(2) # 指数退避
+                        continue
+                    else:
+                        print(f"Failed to add memory for {user_id}: {e}")
+                        return False
+
+    async def _run_tasks(self, max_concurrent):
+        """将原有逻辑拆解为纯异步任务流"""
+        tasks_data = []
+        # --- 保持你原有的数据拆解逻辑不变 ---
+        for idx, item in enumerate(self.data):
+            conversation = item["conversation"]
+            speaker_a = conversation["speaker_a"]
+            speaker_b = conversation["speaker_b"]
+            uids = {"A": f"{speaker_a}_{idx}", "B": f"{speaker_b}_{idx}"}
+
+            for key in conversation.keys():
+                if key in ["speaker_a", "speaker_b"] or "date" in key or "timestamp" in key:
                     continue
-                else:
-                    raise e
+                
+                date_time_key = key + "_date_time"
+                timestamp = conversation.get(date_time_key)
+                chats = conversation[key]
 
-    def add_memories_for_speaker(self, speaker, messages, timestamp, desc):
-        for i in tqdm(range(0, len(messages), self.batch_size), desc=desc):
-            batch_messages = messages[i : i + self.batch_size]
-            self.add_memory(speaker, batch_messages, metadata={"timestamp": timestamp})
+                msg_a, msg_b = [], []
+                for chat in chats:
+                    content = f"{chat['speaker']}: {chat['text']}"
+                    if chat["speaker"] == speaker_a:
+                        msg_a.append({"role": "user", "content": content})
+                        msg_b.append({"role": "assistant", "content": content})
+                    else:
+                        msg_a.append({"role": "assistant", "content": content})
+                        msg_b.append({"role": "user", "content": content})
 
-    def process_conversation(self, item, idx):
-        conversation = item["conversation"]
-        speaker_a = conversation["speaker_a"]
-        speaker_b = conversation["speaker_b"]
+                # 按 batch_size 切分
+                for i in range(0, len(msg_a), self.batch_size):
+                    tasks_data.append((uids["A"], msg_a[i : i + self.batch_size], timestamp))
+                for i in range(0, len(msg_b), self.batch_size):
+                    tasks_data.append((uids["B"], msg_b[i : i + self.batch_size], timestamp))
 
-        speaker_a_user_id = f"{speaker_a}_{idx}"
-        speaker_b_user_id = f"{speaker_b}_{idx}"
+        # --- 异步执行部分 ---
+        semaphore = asyncio.Semaphore(max_concurrent)
+        # 限制 HTTP 连接池，防止内核 Socket 溢出
+        limits = httpx.Limits(max_keepalive_connections=max_concurrent, max_connections=max_concurrent + 2)
+        
+        async with httpx.AsyncClient(limits=limits, timeout=None) as client:
+            tasks = [
+                self._async_add_single(client, uid, msgs, {"timestamp": ts}, semaphore)
+                for uid, msgs, ts in tasks_data
+            ]
+            # 使用 tqdm 监控进度
+            for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Processing Memories"):
+                await f
 
-        # delete all memories for the two users
-        self.mem0_client.delete_all(user_id=speaker_a_user_id)
-        self.mem0_client.delete_all(user_id=speaker_b_user_id)
-
-        for key in conversation.keys():
-            if key in ["speaker_a", "speaker_b"] or "date" in key or "timestamp" in key:
-                continue
-
-            date_time_key = key + "_date_time"
-            timestamp = conversation[date_time_key]
-            chats = conversation[key]
-
-            messages = []
-            messages_reverse = []
-            for chat in chats:
-                if chat["speaker"] == speaker_a:
-                    messages.append({"role": "user", "content": f"{speaker_a}: {chat['text']}"})
-                    messages_reverse.append({"role": "assistant", "content": f"{speaker_a}: {chat['text']}"})
-                elif chat["speaker"] == speaker_b:
-                    messages.append({"role": "assistant", "content": f"{speaker_b}: {chat['text']}"})
-                    messages_reverse.append({"role": "user", "content": f"{speaker_b}: {chat['text']}"})
-                else:
-                    raise ValueError(f"Unknown speaker: {chat['speaker']}")
-
-            # add memories for the two users on different threads
-            thread_a = threading.Thread(
-                target=self.add_memories_for_speaker,
-                args=(speaker_a_user_id, messages, timestamp, "Adding Memories for Speaker A"),
-            )
-            thread_b = threading.Thread(
-                target=self.add_memories_for_speaker,
-                args=(speaker_b_user_id, messages_reverse, timestamp, "Adding Memories for Speaker B"),
-            )
-
-            thread_a.start()
-            thread_b.start()
-            thread_a.join()
-            thread_b.join()
-
-        print("Messages added successfully")
-
-    def process_all_conversations(self, max_workers=10):
+    def process_all_conversations(self, max_workers=3):
+        """对外接口保持一致，内部切换为异步事件循环"""
         if not self.data:
-            raise ValueError("No data loaded. Please set data_path and call load_data() first.")
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(self.process_conversation, item, idx) for idx, item in enumerate(self.data)]
-
-            for future in futures:
-                future.result()
+            raise ValueError("No data loaded.")
+        
+        # 核心改动：在同步方法内启动异步循环
+        asyncio.run(self._run_tasks(max_workers))
+        print("Messages added successfully")

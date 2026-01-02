@@ -8,6 +8,15 @@ from metrics.llm_judge import evaluate_llm_judge
 from metrics.utils import calculate_bleu_scores, calculate_metrics
 from tqdm import tqdm
 
+# 类别映射表
+CATEGORY_MAPPING = {
+    "1": "multi-hop",
+    "2": "temporal", 
+    "3": "open-domain",
+    "4": "single-hop",
+    "5": "adversarial"
+}
+
 
 def process_item(item_data):
     k, v = item_data
@@ -19,7 +28,7 @@ def process_item(item_data):
         category = str(item["category"])
         question = str(item["question"])
 
-        # Skip category 5
+        # Skip category 5 (adversarial)
         if category == "5":
             continue
 
@@ -27,12 +36,16 @@ def process_item(item_data):
         bleu_scores = calculate_bleu_scores(pred_answer, gt_answer)
         llm_score = evaluate_llm_judge(question, gt_answer, pred_answer)
 
+        # 使用类别名称而不是数字
+        category_name = CATEGORY_MAPPING.get(category, f"category_{category}")
+
         local_results[k].append(
             {
                 "question": question,
                 "answer": gt_answer,
                 "response": pred_answer,
                 "category": category,
+                "category_name": category_name,
                 "bleu_score": bleu_scores["bleu1"],
                 "f1_score": metrics["f1"],
                 "llm_score": llm_score,

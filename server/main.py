@@ -56,26 +56,29 @@ HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/app/history/history.db")
 # }
 DEFAULT_CONFIG = {
     "llm": {
-        "provider": "deepseek",
+        "provider": "vllm",
         "config": {
-            "model": "deepseek-chat",  
-            "temperature": 0.2,
+            "model": "Qwen/Qwen3-4B-Instruct-2507",
+            "vllm_base_url": "http://localhost:8000/v1",
+            "temperature": 0,
+            "max_tokens": 2000,
         }
     },
     "embedder": {
-        "provider": "openai",
+        "provider": "ollama",
         "config": {
-            # Provider-specific settings go here
-            "model": "text-embedding-v4",
-            "openai_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"  # Optional custom base URL
-        }
+            "model": "qwen3-embedding:0.6b",
+            "ollama_base_url": "http://localhost:11434",
+            "embedding_dims": 1024
+        },
     },
     "vector_store": {
         "provider": "qdrant",
         "config": {
-            "collection_name": "test",
+            "collection_name": "mem0",
             "host": "localhost",
             "port": 6333,
+            "embedding_model_dims": 1024
         }
     }
 }
