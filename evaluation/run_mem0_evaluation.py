@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""
-整合的mem0评估流程脚本
-将search、evals、generate_scores三个步骤合并为一个流程
-"""
-
 import argparse
 import json
 import os
 import sys
+import threading  # 1. 移动到这里，确保全局可用
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -15,34 +11,36 @@ from datetime import datetime
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-from src.memzero.search import MemorySearch
-from metrics.llm_judge import evaluate_llm_judge
-from metrics.utils import calculate_bleu_scores, calculate_metrics
+# 注意：请确保这些模块在你的路径中
+try:
+    from src.memzero.search import MemorySearch
+    from metrics.llm_judge import evaluate_llm_judge
+    from metrics.utils import calculate_bleu_scores, calculate_metrics
+except ImportError as e:
+    print(f"导入模块失败: {e}")
 
 load_dotenv()
 
 # 类别映射表
 CATEGORY_MAPPING = {
     "1": "multi-hop",
-    "2": "temporal", 
+    "2": "", 
     "3": "open-domain",
     "4": "single-hop",
     "5": "adversarial"
 }
 
-
 def process_item(item_data):
-    """处理单个评估项目，来自evals.py的逻辑"""
+    """处理单个评估项目"""
     k, v = item_data
     local_results = defaultdict(list)
 
     for item in v:
-        gt_answer = str(item["answer"])
-        pred_answer = str(item["response"])
-        category = str(item["category"])
-        question = str(item["question"])
+        gt_answer = str(item.get("answer", ""))
+        pred_answer = str(item.get("response", ""))
+        category = str(item.get("category", ""))
+        question = str(item.get("question", ""))
 
-        # Skip category 5 (adversarial)
         if category == "5":
             continue
 
@@ -50,33 +48,24 @@ def process_item(item_data):
         bleu_scores = calculate_bleu_scores(pred_answer, gt_answer)
         llm_score = evaluate_llm_judge(question, gt_answer, pred_answer)
 
-        # 使用类别名称而不是数字
         category_name = CATEGORY_MAPPING.get(category, f"category_{category}")
 
-        local_results[k].append(
-            {
-                "question": question,
-                "answer": gt_answer,
-                "response": pred_answer,
-                "category": category,
-                "category_name": category_name,
-                "bleu_score": bleu_scores["bleu1"],
-                "f1_score": metrics["f1"],
-                "llm_score": llm_score,
-            }
-        )
+        local_results[k].append({
+            "question": question,
+            "answer": gt_answer,
+            "response": pred_answer,
+            "category": category,
+            "category_name": category_name,
+            "bleu_score": bleu_scores["bleu1"],
+            "f1_score": metrics["f1"],
+            "llm_score": llm_score,
+        })
 
     return local_results
 
-
 def run_evaluation(data_file, output_folder, top_k=30, filter_memories=False, is_graph=False, max_workers=10):
-    """运行完整的评估流程"""
-
-    # 创建时间戳用于结果目录
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment_name = f"mem0_eval_top{top_k}_filter{filter_memories}_graph{is_graph}_{timestamp}"
-
-    # 创建实验结果目录
     experiment_dir = os.path.join(output_folder, experiment_name)
     os.makedirs(experiment_dir, exist_ok=True)
 
@@ -86,7 +75,6 @@ def run_evaluation(data_file, output_folder, top_k=30, filter_memories=False, is
     # Step 1: 运行搜索
     print(f"\n🔍 Step 1: 运行记忆搜索...")
     search_results_file = os.path.join(experiment_dir, "search_results.json")
-
     memory_searcher = MemorySearch(
         output_path=search_results_file,
         top_k=top_k,
@@ -94,7 +82,7 @@ def run_evaluation(data_file, output_folder, top_k=30, filter_memories=False, is
         is_graph=is_graph
     )
     memory_searcher.process_data_file(data_file)
-    print(f"✅ 搜索完成，结果保存到: {search_results_file}")
+    print(f"✅ 搜索完成")
 
     # Step 2: 运行评估
     print(f"\n📊 Step 2: 生成评估指标...")
@@ -106,121 +94,68 @@ def run_evaluation(data_file, output_folder, top_k=30, filter_memories=False, is
     results = defaultdict(list)
     results_lock = threading.Lock()
 
-    # Use ThreadPoolExecutor with specified workers
+    # 优化后的多线程评估逻辑
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_item, item_data) for item_data in search_data.items()]
-
-        for future in tqdm(ThreadPoolExecutor(max_workers=max_workers).map(lambda f: f.result(), futures),
-                          total=len(futures), desc="处理评估"):
-            local_results = future.result()
+        # 将 items() 转换为列表进行迭代
+        items_to_process = list(search_data.items())
+        
+        # 使用 list() 包装 map 以便立即开始执行，并在 tqdm 中显示进度
+        for local_res in tqdm(executor.map(process_item, items_to_process), 
+                             total=len(items_to_process), 
+                             desc="处理评估"):
             with results_lock:
-                for k, items in local_results.items():
+                for k, items in local_res.items():
                     results[k].extend(items)
 
-    # Save evaluation metrics
+    # 2. 修正语法错误：json.() -> json.dump()
     with open(eval_metrics_file, "w") as f:
-        json.dump(results, f, indent=4)
-    print(f"✅ 评估完成，指标保存到: {eval_metrics_file}")
+        json.dump(results, f, indent=4, ensure_ascii=False)
+    print(f"✅ 评估指标保存完成")
 
-    # Step 3: 生成得分并保存CSV
+    # Step 3: 生成得分报告
     print(f"\n📈 Step 3: 生成得分报告...")
     scores_csv_file = os.path.join(experiment_dir, "scores.csv")
 
-    # Flatten the data into a list of question items
     all_items = []
     for key in results:
         all_items.extend(results[key])
 
-    # Convert to DataFrame and save as CSV
     import pandas as pd
-
     df = pd.DataFrame(all_items)
 
-    # 按类别名称分组而不是数字
     category_results = df.groupby("category_name").agg({
         "bleu_score": "mean",
         "f1_score": "mean",
         "llm_score": "mean"
     }).round(4)
-
-    # Add count of questions per category
     category_results["count"] = df.groupby("category_name").size()
 
-    # Calculate overall means
     overall_means = df.agg({"bleu_score": "mean", "f1_score": "mean", "llm_score": "mean"}).round(4)
-
-    # Save results to CSV
     category_results.to_csv(scores_csv_file)
-    print(f"✅ 得分报告保存到: {scores_csv_file}")
 
-    # 打印结果到终端
-    print("\n📊 评估结果:")
-    print("\n各类别平均得分:")
-    print(category_results)
-
-    print("\n总体平均得分:")
-    print(overall_means)
-
-    # 创建实验元数据文件
+    # 保存元数据
     metadata = {
         "experiment_name": experiment_name,
-        "timestamp": timestamp,
-        "parameters": {
-            "data_file": data_file,
-            "top_k": top_k,
-            "filter_memories": filter_memories,
-            "is_graph": is_graph,
-            "max_workers": max_workers
-        },
-        "files": {
-            "search_results": search_results_file,
-            "evaluation_metrics": eval_metrics_file,
-            "scores_csv": scores_csv_file
-        },
+        "parameters": {"top_k": top_k, "is_graph": is_graph},
         "overall_scores": overall_means.to_dict()
     }
+    with open(os.path.join(experiment_dir, "metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=4, ensure_ascii=False)
 
-    metadata_file = os.path.join(experiment_dir, "metadata.json")
-    with open(metadata_file, "w") as f:
-        json.dump(metadata, f, indent=4)
-
-    print(f"\n🎯 实验完成！所有结果保存在: {experiment_dir}")
-    print(f"📋 实验元数据: {metadata_file}")
-
+    print("\n📊 评估完成！")
+    print(category_results)
     return experiment_dir
-
 
 def main():
     parser = argparse.ArgumentParser(description="运行完整的mem0评估流程")
-    parser.add_argument(
-        "--data_file", type=str, default="dataset/locomo10.json",
-        help="数据集文件路径"
-    )
-    parser.add_argument(
-        "--output_folder", type=str, default="results/",
-        help="输出文件夹路径"
-    )
-    parser.add_argument(
-        "--top_k", type=int, default=30,
-        help="检索的记忆数量"
-    )
-    parser.add_argument(
-        "--filter_memories", action="store_true", default=False,
-        help="是否过滤记忆"
-    )
-    parser.add_argument(
-        "--is_graph", action="store_true", default=False,
-        help="是否使用图谱搜索"
-    )
-    parser.add_argument(
-        "--max_workers", type=int, default=10,
-        help="最大工作线程数"
-    )
+    parser.add_argument("--data_file", type=str, default="dataset/locomo10.json")
+    parser.add_argument("--output_folder", type=str, default="results/")
+    parser.add_argument("--top_k", type=int, default=30)
+    parser.add_argument("--filter_memories", action="store_true")
+    parser.add_argument("--is_graph", action="store_true")
+    parser.add_argument("--max_workers", type=int, default=10)
 
     args = parser.parse_args()
-
-    # 导入threading以支持ThreadPoolExecutor
-    import threading
 
     run_evaluation(
         data_file=args.data_file,
@@ -230,7 +165,6 @@ def main():
         is_graph=args.is_graph,
         max_workers=args.max_workers
     )
-
 
 if __name__ == "__main__":
     main()

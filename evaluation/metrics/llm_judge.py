@@ -6,8 +6,10 @@ import numpy as np
 from openai import OpenAI
 
 from mem0.memory.utils import extract_json
-
-client = OpenAI()
+import os
+from dotenv import load_dotenv
+load_dotenv()
+client = OpenAI(base_url="http://localhost:8000/v1")
 
 ACCURACY_PROMPT = """
 Your task is to label an answer to a question as ’CORRECT’ or ’WRONG’. You will be given the following data:
@@ -39,7 +41,7 @@ Just return the label CORRECT or WRONG in a json format with the key as "label".
 def evaluate_llm_judge(question, gold_answer, generated_answer):
     """Evaluate the generated answer against the gold answer using an LLM judge."""
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=os.getenv("MODEL"),
         messages=[
             {
                 "role": "user",
