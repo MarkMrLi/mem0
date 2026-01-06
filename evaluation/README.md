@@ -15,8 +15,11 @@ This project evaluates Mem0 and compares it with different memory and retrieval 
 4. **Full-Context Processing**: We examine the effectiveness of passing the entire conversation history within the context window of the LLM as a baseline approach.
 5. **Proprietary Memory Systems**: We evaluate OpenAI's built-in memory feature available in their ChatGPT interface to compare against commercial solutions.
 6. **Third-Party Memory Providers**: We incorporate Zep, a specialized memory management platform designed for AI agents, to assess the performance of dedicated memory infrastructure.
+7. **LongMemEval Integration**: We've integrated comprehensive support for the LongMemEval benchmark, enabling advanced evaluation of long-term memory systems with detailed performance tracking across multiple top_k configurations.
 
-We test these techniques on the LOCOMO dataset, which contains conversational data with various question types to evaluate memory recall and understanding.
+We test these techniques on two major benchmarks:
+- **LOCOMO Dataset**: Conversational data for evaluating memory recall and understanding across various question types
+- **LongMemEval Dataset**: Advanced benchmark for comprehensive long-term memory system evaluation with temporal reasoning and knowledge update scenarios
 
 ## 🔍 Dataset
 
@@ -27,8 +30,15 @@ The LOCOMO dataset used in our experiments can be downloaded from our Google Dri
 The dataset contains conversational data specifically designed to test memory recall and understanding across various question types and complexity levels.
 
 Place the dataset files in the `dataset/` directory:
+
+### LOCOMO Dataset
 - `locomo10.json`: Original dataset
 - `locomo10_rag.json`: Dataset formatted for RAG experiments
+
+### LongMemEval Dataset
+- `longmemeval_s.json`: Small dataset (for testing)
+- `longmemeval_m.json`: Medium dataset
+- `longmemeval_l.json`: Large dataset
 
 ## 📁 Project Structure
 
@@ -38,6 +48,11 @@ Place the dataset files in the `dataset/` directory:
 │   ├── mem0/             # Implementation of the Mem0 technique
 │   ├── openai/           # Implementation of the OpenAI memory
 │   ├── zep/              # Implementation of the Zep memory
+│   ├── longmemeval/      # LongMemEval integration module
+│   │   ├── data_converter.py    # Data format conversion
+│   │   ├── add.py              # Memory addition with performance tracking
+│   │   ├── search.py           # Multi-top_k search and response
+│   │   └── performance_evaluator.py  # Performance metrics collection
 │   ├── rag.py            # Implementation of the RAG technique
 │   └── langmem.py        # Implementation of the Language-based memory
 ├── metrics/              # Code for evaluation metrics
@@ -45,7 +60,9 @@ Place the dataset files in the `dataset/` directory:
 ├── dataset/              # Dataset files
 ├── evals.py              # Evaluation script
 ├── run_experiments.py    # Script to run experiments
+├── run_longmemeval_eval.py  # Script to run LongMemEval evaluation
 ├── generate_scores.py    # Script to generate scores from results
+├── LONGMEMEVAL_USAGE.md  # LongMemEval usage guide
 └── prompts.py            # Prompts used for the models
 ```
 
@@ -98,13 +115,24 @@ make run-zep-search       # Search memories using Zep
 
 # Run OpenAI experiments
 make run-openai           # Run OpenAI experiments
+
+# Run LongMemEval experiments
+python run_longmemeval_eval.py --dataset dataset/longmemeval_s.json    # Basic evaluation
+python run_longmemeval_eval.py --dataset dataset/longmemeval_s.json --top_k 5 10 15  # Custom top_k values
+python run_longmemeval_eval.py --dataset dataset/longmemeval_s.json --limit 5  # Quick test
 ```
 
 Alternatively, you can run experiments directly with custom parameters:
 
 ```bash
+# LOCOMO experiments
 python run_experiments.py --technique_type [mem0|rag|langmem] [additional parameters]
+
+# LongMemEval experiments
+python run_longmemeval_eval.py --dataset <dataset_path> [additional parameters]
 ```
+
+See `LONGMEMEVAL_USAGE.md` for detailed LongMemEval usage instructions.
 
 #### Command-line Parameters:
 
