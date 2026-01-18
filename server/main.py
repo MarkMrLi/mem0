@@ -164,7 +164,28 @@ def get_memory(memory_id: str):
         logging.exception("Error in get_memory:")
         raise HTTPException(status_code=500, detail=str(e))
 
-
+@app.post("/prompts/save", summary="Persist prompts to disk")
+def trigger_save_prompts(file_path: str = "prompts_storage.json"):
+    """
+    手动触发将内存中的 extraction_prompts 和 update_prompts 保存到本地文件。
+    """
+    try:
+        # 调用实例的保存方法
+        MEMORY_INSTANCE.save_prompts(file_path=file_path)
+        
+        return {
+            "status": "success",
+            "message": f"Prompts successfully persisted to {file_path}",
+            "counts": {
+                "extraction_prompts": len(MEMORY_INSTANCE.extraction_prompts),
+                "update_prompts": len(MEMORY_INSTANCE.update_prompts)
+            }
+        }
+    except Exception as e:
+        logging.exception("Error in trigger_save_prompts:")
+        # 抛出 500 错误，并返回具体异常信息
+        raise HTTPException(status_code=500, detail=f"Failed to save prompts: {str(e)}")
+    
 @app.post("/search", summary="Search memories")
 def search_memories(search_req: SearchRequest):
     """Search for memories based on a query."""

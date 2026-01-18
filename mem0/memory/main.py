@@ -168,6 +168,8 @@ class Memory(MemoryBase):
             self.config.vector_store.provider, telemetry_config
         )
         capture_event("mem0.init", self, {"sync_type": "sync"})
+        self.extraction_prompts = []
+        self.update_prompts = []
 
     @classmethod
     def from_config(cls, config_dict: Dict[str, Any]):
@@ -361,7 +363,10 @@ class Memory(MemoryBase):
             ],
             response_format={"type": "json_object"},
         )
-
+        self.extraction_prompts.append(messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ])
         try:
             response = remove_code_blocks(response)
             new_retrieved_facts = json.loads(response)["facts"]
@@ -409,6 +414,7 @@ class Memory(MemoryBase):
                     messages=[{"role": "user", "content": function_calling_prompt}],
                     response_format={"type": "json_object"},
                 )
+                self.update_prompts.append(messages=[{"role": "user", "content": function_calling_prompt}])
             except Exception as e:
                 logger.error(f"Error in new memory actions response: {e}")
                 response = ""
@@ -1007,6 +1013,23 @@ class Memory(MemoryBase):
     def chat(self, query):
         raise NotImplementedError("Chat function not implemented yet.")
 
+    def save_prompts(self, file_path="prompts_storage.json"):
+        """
+        将 extraction_prompts 和 update_prompts 持久化到 JSON 文件中
+        """
+        # 构造要保存的数据字典
+        data_to_save = {
+            "extraction_prompts": self.extraction_prompts,
+            "update_prompts": self.update_prompts
+        }
+        
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                # indent=4 让文件排版整齐，ensure_ascii=False 保证中文不乱码
+                json.dump(data_to_save, f, indent=4, ensure_ascii=False)
+            print(f"成功保存至: {os.path.abspath(file_path)}")
+        except Exception as e:
+            print(f"保存失败，错误原因: {e}")
 
 class AsyncMemory(MemoryBase):
     def __init__(self, config: MemoryConfig = MemoryConfig()):
