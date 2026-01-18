@@ -1227,13 +1227,13 @@ class AsyncMemory(MemoryBase):
                          all_embeddings.append(emb)
             else:
                 # [LEGACY] 串行处理：为了保持原有逻辑的一致性（虽然这里也可以用并发）
-                all_embeddings = []
+                all_embeddings = {}
                 for item in valid_items:
                     emb = await asyncio.to_thread(self.embedding_model.embed, item["content"], "add")
-                    all_embeddings.append(emb)
+                    all_embeddings[item["content"]] = emb
 
             for i, item in enumerate(valid_items):
-                mem_id = await self._create_memory(item["content"], all_embeddings[i], per_msg_meta)
+                mem_id = await self._create_memory(item["content"], all_embeddings, per_msg_meta)
                 actor_name = item["actor_name"]
                 returned_memories.append(
                     {
