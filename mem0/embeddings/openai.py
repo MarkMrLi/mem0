@@ -41,9 +41,17 @@ class OpenAIEmbedding(EmbeddingBase):
         Returns:
             list: The embedding vector.
         """
-        text = text.replace("\n", " ")
-        return (
-            self.client.embeddings.create(input=[text], model=self.config.model, dimensions=self.config.embedding_dims)
-            .data[0]
-            .embedding
+        is_batch = isinstance(text, list)
+        if is_batch:
+            inputs = [t.replace("\n", " ") for t in text]
+        else:
+            inputs = [text.replace("\n", " ")]
+        response = self.client.embeddings.create(
+            input=inputs, 
+            model=self.config.model, 
+            dimensions=self.config.embedding_dims
         )
+
+        embeddings = [item.embedding for item in response.data]
+
+        return embeddings if is_batch else embeddings[0]

@@ -1080,6 +1080,7 @@ class AsyncMemory(MemoryBase):
         memory_type: Optional[str] = None,
         prompt: Optional[str] = None,
         llm=None,
+        enable_batch=False,
     ):
         """
         Create a new memory asynchronously.
@@ -1133,7 +1134,7 @@ class AsyncMemory(MemoryBase):
             messages = parse_vision_messages(messages)
 
         vector_store_task = asyncio.create_task(
-            self._add_to_vector_store(messages, processed_metadata, effective_filters, infer)
+            self._add_to_vector_store(messages, processed_metadata, effective_filters, infer, enable_batch)
         )
         graph_task = asyncio.create_task(self._add_to_graph(messages, effective_filters))
 
@@ -1163,9 +1164,11 @@ class AsyncMemory(MemoryBase):
         metadata: dict,
         effective_filters: dict,
         infer: bool,
+        enable_batch: bool,
     ):
         if not infer:
             returned_memories = []
+            valid_items = []
             for message_dict in messages:
                 if (
                     not isinstance(message_dict, dict)
@@ -1185,17 +1188,60 @@ class AsyncMemory(MemoryBase):
                 if actor_name:
                     per_msg_meta["actor_id"] = actor_name
 
-                msg_content = message_dict["content"]
-                msg_embeddings = await asyncio.to_thread(self.embedding_model.embed, msg_content, "add")
-                mem_id = await self._create_memory(msg_content, msg_embeddings, per_msg_meta)
+                valid_items.append({
+                    "content": message_dict["content"],
+                    "metadata": per_msg_meta,
+                    "actor_name": actor_name,
+                    "role": message_dict["role"]
+                })
 
+                # msg_content = message_dict["content"]
+                # msg_embeddings = await asyncio.to_thread(self.embedding_model.embed, msg_content, "add")
+                # mem_id = await self._create_memory(msg_content, msg_embeddings, per_msg_meta)
+
+                # returned_memories.append(
+                #     {
+                #         "id": mem_id,
+                #         "memory": msg_content,
+                #         "event": "ADD",
+                #         "actor_id": actor_name if actor_name else None,
+                #         "role": message_dict["role"],
+                #     }
+                # )
+            if not valid_items:
+                return []
+            
+            if enable_batch:
+                # [OPTIMIZATION] 批量处理：一次调用处理所有 content
+                contents = [item["content"] for item in valid_items]
+                try:
+                    # 假设 self.embedding_model.embed 支持列表输入并返回列表
+                    # 如果不支持，这里需要兼容性处理
+                    all_embeddings = await asyncio.to_thread(self.embedding_model.embed, contents, "add")
+                except Exception as e:
+                    logger.error(f"Batch embedding failed: {e}. Falling back to sequential.")
+                    # 如果 Batch 失败（比如模型不支持），回退到串行
+                    all_embeddings = []
+                    for content in contents:
+                         emb = await asyncio.to_thread(self.embedding_model.embed, content, "add")
+                         all_embeddings.append(emb)
+            else:
+                # [LEGACY] 串行处理：为了保持原有逻辑的一致性（虽然这里也可以用并发）
+                all_embeddings = []
+                for item in valid_items:
+                    emb = await asyncio.to_thread(self.embedding_model.embed, item["content"], "add")
+                    all_embeddings.append(emb)
+
+            for i, item in enumerate(valid_items):
+                mem_id = await self._create_memory(item["content"], all_embeddings[i], per_msg_meta)
+                actor_name = item["actor_name"]
                 returned_memories.append(
                     {
                         "id": mem_id,
-                        "memory": msg_content,
+                        "memory": item["content"],
                         "event": "ADD",
                         "actor_id": actor_name if actor_name else None,
-                        "role": message_dict["role"],
+                        "role": item["role"],
                     }
                 )
             return returned_memories
