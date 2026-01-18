@@ -25,6 +25,8 @@ from mem0.memory.base import MemoryBase
 from mem0.memory.setup import mem0_dir, setup_config
 from mem0.memory.storage import SQLiteManager
 from mem0.memory.telemetry import capture_event
+capture_event = lambda *args, **kargs: None
+import time
 from mem0.memory.utils import (
     get_fact_retrieval_messages,
     parse_messages,
@@ -1138,7 +1140,7 @@ class AsyncMemory(MemoryBase):
         )
         graph_task = asyncio.create_task(self._add_to_graph(messages, effective_filters))
 
-        vector_store_result, graph_result = await asyncio.gather(vector_store_task, graph_task)
+        (vector_store_result,time_cost), graph_result = await asyncio.gather(vector_store_task, graph_task)
 
         if self.api_version == "v1.0":
             warnings.warn(
@@ -1156,7 +1158,7 @@ class AsyncMemory(MemoryBase):
                 "relations": graph_result,
             }
 
-        return {"results": vector_store_result}
+        return {"results": vector_store_result,"time_cost": time_cost}
 
     async def _add_to_vector_store(
         self,
@@ -1195,45 +1197,27 @@ class AsyncMemory(MemoryBase):
                     "role": message_dict["role"]
                 })
 
-                # msg_content = message_dict["content"]
-                # msg_embeddings = await asyncio.to_thread(self.embedding_model.embed, msg_content, "add")
-                # mem_id = await self._create_memory(msg_content, msg_embeddings, per_msg_meta)
-
-                # returned_memories.append(
-                #     {
-                #         "id": mem_id,
-                #         "memory": msg_content,
-                #         "event": "ADD",
-                #         "actor_id": actor_name if actor_name else None,
-                #         "role": message_dict["role"],
-                #     }
-                # )
             if not valid_items:
                 return []
-            
+            contents = [item["content"] for item in valid_items]
+            emb_start_time = time.perf_counter()
             if enable_batch:
-                # [OPTIMIZATION] 批量处理：一次调用处理所有 content
-                contents = [item["content"] for item in valid_items]
                 try:
                     # 假设 self.embedding_model.embed 支持列表输入并返回列表
-                    # 如果不支持，这里需要兼容性处理
                     all_embeddings = await asyncio.to_thread(self.embedding_model.embed, contents, "add")
                 except Exception as e:
                     logger.error(f"Batch embedding failed: {e}. Falling back to sequential.")
-                    # 如果 Batch 失败（比如模型不支持），回退到串行
-                    all_embeddings = []
-                    for content in contents:
-                         emb = await asyncio.to_thread(self.embedding_model.embed, content, "add")
-                         all_embeddings.append(emb)
             else:
-                # [LEGACY] 串行处理：为了保持原有逻辑的一致性（虽然这里也可以用并发）
-                all_embeddings = {}
-                for item in valid_items:
-                    emb = await asyncio.to_thread(self.embedding_model.embed, item["content"], "add")
-                    all_embeddings[item["content"]] = emb
+                all_embeddings = []
+                emb_tasks = [asyncio.to_thread(self.embedding_model.embed, c, "add") for c in contents]
+                all_embeddings = await asyncio.gather(*emb_tasks)
+            emb_duration = time.perf_counter() - emb_start_time
 
-            for i, item in enumerate(valid_items):
-                mem_id = await self._create_memory(item["content"], all_embeddings, per_msg_meta)
+            emb_cache = dict(zip(contents, all_embeddings))
+
+            db_start_time = time.perf_counter()
+            for item in valid_items:
+                mem_id = await self._create_memory(item["content"], emb_cache, per_msg_meta)
                 actor_name = item["actor_name"]
                 returned_memories.append(
                     {
@@ -1244,7 +1228,8 @@ class AsyncMemory(MemoryBase):
                         "role": item["role"],
                     }
                 )
-            return returned_memories
+            db_duration = time.perf_counter() - db_start_time
+            return returned_memories,{"emb_duration": emb_duration,"db_duration":db_duration}
 
         parsed_messages = parse_messages(messages)
         if self.config.custom_fact_extraction_prompt:
