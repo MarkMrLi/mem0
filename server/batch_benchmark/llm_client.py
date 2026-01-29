@@ -5,17 +5,23 @@ Supports both real API calls and mock mode for testing.
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+# Disable proxy for localhost connections
+os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
+
 # OpenAI is optional - only needed for real API calls
 try:
     from openai import AsyncOpenAI
+    import httpx
 
     HAS_OPENAI = True
 except ImportError:
     AsyncOpenAI = None
+    httpx = None
     HAS_OPENAI = False
 
 # Support both direct run and package import
@@ -54,10 +60,18 @@ class LLMClient:
         if not self.mock_mode:
             if not HAS_OPENAI:
                 raise ImportError("openai package is required for real API calls. Install with: pip install openai")
+
+            # Create httpx client with proxy disabled for localhost
+            http_client = httpx.AsyncClient(
+                proxy=None,  # Explicitly disable proxy
+                verify=True,
+            )
+
             self._client = AsyncOpenAI(
                 base_url=self.config.base_url,
                 api_key=self.config.api_key,
                 timeout=self.config.timeout,
+                http_client=http_client,
             )
 
     async def chat_completion(
