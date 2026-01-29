@@ -1,6 +1,12 @@
 """
-Benchmark strategies for comparing different LLM call patterns.
-Implements sequential, concurrent, and batched approaches.
+Benchmark strategies for comparing different LLM call scheduling patterns.
+
+Implements two main strategies:
+1. Mem0NativeStrategy: E1→U1→E2→U2→... (sequential, simulates mem0 native behavior)
+2. ConcurrentHttpStrategy: [E1,E2,...] concurrent → [U1,U2,...] concurrent
+
+The goal is to measure the impact of vLLM's prefix caching when requests
+with shared prefixes are batched together.
 """
 
 import asyncio
@@ -11,20 +17,8 @@ from typing import Any, Dict, List, Optional
 # Support both direct run and package import
 try:
     from .llm_client import LLMClient, LLMResponse
-    from .prompt_batcher import (
-        BatchedPrompt,
-        create_batched_extraction_prompt,
-        parse_batched_response,
-        unbatch_results,
-    )
 except ImportError:
     from llm_client import LLMClient, LLMResponse
-    from prompt_batcher import (
-        BatchedPrompt,
-        create_batched_extraction_prompt,
-        parse_batched_response,
-        unbatch_results,
-    )
 
 
 @dataclass
@@ -47,6 +41,9 @@ class StrategyResult:
     results: List[Dict[str, Any]] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
+    # Cache metrics (if available)
+    cache_hit_rate: Optional[float] = None
+
     @property
     def avg_latency_ms(self) -> float:
         return sum(self.latencies_ms) / len(self.latencies_ms) if self.latencies_ms else 0
@@ -60,6 +57,7 @@ class StrategyResult:
         return self.num_requests / (self.total_time_ms / 1000) if self.total_time_ms > 0 else 0
 
     def summary(self) -> str:
+        cache_info = f"  Cache Hit Rate:  {self.cache_hit_rate:.1f}%\n" if self.cache_hit_rate is not None else ""
         return f"""
 Strategy: {self.strategy_name}
 {"=" * 50}
@@ -75,9 +73,9 @@ Token Usage:
 
 Latency (ms):
   Average:         {self.avg_latency_ms:.1f}
-  Min:             {min(self.latencies_ms):.1f} (per call)
-  Max:             {max(self.latencies_ms):.1f} (per call)
-
+  Min:             {min(self.latencies_ms) if self.latencies_ms else 0:.1f} (per call)
+  Max:             {max(self.latencies_ms) if self.latencies_ms else 0:.1f} (per call)
+{cache_info}
 Errors:            {len(self.errors)}
 {"=" * 50}
 """
@@ -91,50 +89,75 @@ class BaseStrategy:
     def __init__(self, client: LLMClient):
         self.client = client
 
-    async def run_extraction(
+    async def run(
         self,
-        prompts: List[List[Dict[str, str]]],
+        extraction_prompts: List[List[Dict[str, str]]],
+        update_prompts: List[List[Dict[str, str]]],
     ) -> StrategyResult:
-        """Run extraction phase with this strategy."""
+        """
+        Run the full add workflow with this strategy.
+
+        Args:
+            extraction_prompts: List of message arrays for extraction phase
+            update_prompts: List of message arrays for update phase
+
+        Returns:
+            Combined result for both phases
+        """
         raise NotImplementedError
 
-    async def run_update(
-        self,
-        prompts: List[List[Dict[str, str]]],
-    ) -> StrategyResult:
-        """Run update phase with this strategy."""
-        raise NotImplementedError
 
-
-class SequentialStrategy(BaseStrategy):
+class Mem0NativeStrategy(BaseStrategy):
     """
-    Sequential strategy: Execute requests one by one.
-    This is the baseline for comparison.
+    Simulates mem0's native sequential behavior.
+
+    For N add requests:
+    - Processes each request completely before moving to the next
+    - Pattern: E1→U1→E2→U2→E3→U3→...
+
+    This is the baseline for comparison. vLLM's prefix cache won't be
+    effective here because requests with shared prefixes are separated
+    by different prompts.
     """
 
-    name = "sequential"
+    name = "mem0_native"
 
-    async def run_extraction(
+    async def run(
         self,
-        prompts: List[List[Dict[str, str]]],
+        extraction_prompts: List[List[Dict[str, str]]],
+        update_prompts: List[List[Dict[str, str]]],
     ) -> StrategyResult:
         start_time = time.perf_counter()
 
         responses: List[LLMResponse] = []
-        for prompt_msgs in prompts:
-            response = await self.client.chat_completion(
-                messages=prompt_msgs,
+        n_requests = len(extraction_prompts)
+        n_updates = len(update_prompts)
+
+        # Interleave extraction and update calls to simulate mem0 native behavior
+        # E1→U1→E2→U2→...
+        for i in range(n_requests):
+            # Extraction call
+            extraction_response = await self.client.chat_completion(
+                messages=extraction_prompts[i],
                 response_format={"type": "json_object"},
             )
-            responses.append(response)
+            responses.append(extraction_response)
+
+            # Update call (if available)
+            if i < n_updates:
+                update_response = await self.client.chat_completion(
+                    messages=update_prompts[i],
+                    response_format={"type": "json_object"},
+                )
+                responses.append(update_response)
 
         total_time = (time.perf_counter() - start_time) * 1000
 
         return StrategyResult(
             strategy_name=self.name,
             total_time_ms=total_time,
-            num_requests=len(prompts),
-            num_llm_calls=len(prompts),
+            num_requests=n_requests,
+            num_llm_calls=len(responses),
             total_input_tokens=sum(r.input_tokens for r in responses),
             total_output_tokens=sum(r.output_tokens for r in responses),
             latencies_ms=[r.latency_ms for r in responses],
@@ -142,45 +165,114 @@ class SequentialStrategy(BaseStrategy):
             errors=[r.error for r in responses if r.error],
         )
 
-    async def run_update(
-        self,
-        prompts: List[List[Dict[str, str]]],
-    ) -> StrategyResult:
-        # Update phase is the same as extraction for sequential
-        return await self.run_extraction(prompts)
 
-
-class ConcurrentStrategy(BaseStrategy):
+class ConcurrentHttpStrategy(BaseStrategy):
     """
-    Concurrent strategy: Execute all requests in parallel using asyncio.
-    vLLM will automatically batch these requests.
+    Batches requests by phase using concurrent HTTP calls.
+
+    For N add requests:
+    - First, run all extraction requests concurrently
+    - Then, run all update requests concurrently
+    - Pattern: [E1,E2,E3,...] → [U1,U2,U3,...]
+
+    vLLM will automatically batch concurrent requests with shared prefixes,
+    enabling prefix cache hits on the shared system prompt.
     """
 
-    name = "concurrent"
+    name = "concurrent_http"
 
-    def __init__(self, client: LLMClient, max_concurrent: int = 10):
+    def __init__(self, client: LLMClient, max_concurrent: int = 50):
         super().__init__(client)
         self.max_concurrent = max_concurrent
 
-    async def run_extraction(
+    async def run(
         self,
-        prompts: List[List[Dict[str, str]]],
+        extraction_prompts: List[List[Dict[str, str]]],
+        update_prompts: List[List[Dict[str, str]]],
     ) -> StrategyResult:
         start_time = time.perf_counter()
 
-        responses = await self.client.batch_chat_completion(
-            messages_list=prompts,
+        all_responses: List[LLMResponse] = []
+
+        # Phase 1: All extractions concurrently
+        extraction_responses = await self.client.batch_chat_completion(
+            messages_list=extraction_prompts,
             response_format={"type": "json_object"},
             max_concurrent=self.max_concurrent,
         )
+        all_responses.extend(extraction_responses)
+
+        # Phase 2: All updates concurrently
+        if update_prompts:
+            update_responses = await self.client.batch_chat_completion(
+                messages_list=update_prompts,
+                response_format={"type": "json_object"},
+                max_concurrent=self.max_concurrent,
+            )
+            all_responses.extend(update_responses)
 
         total_time = (time.perf_counter() - start_time) * 1000
 
         return StrategyResult(
             strategy_name=self.name,
             total_time_ms=total_time,
-            num_requests=len(prompts),
-            num_llm_calls=len(prompts),  # Still N calls, but concurrent
+            num_requests=len(extraction_prompts),
+            num_llm_calls=len(all_responses),
+            total_input_tokens=sum(r.input_tokens for r in all_responses),
+            total_output_tokens=sum(r.output_tokens for r in all_responses),
+            latencies_ms=[r.latency_ms for r in all_responses],
+            results=[{"content": r.content, "success": r.success} for r in all_responses],
+            errors=[r.error for r in all_responses if r.error],
+        )
+
+
+class ExtractionOnlyStrategy(BaseStrategy):
+    """
+    Run only extraction phase - useful for isolating prefix cache effects.
+
+    Extraction prompts share the same ~2000 token system prompt, making
+    them ideal for measuring prefix cache effectiveness.
+    """
+
+    name = "extraction_only"
+
+    def __init__(self, client: LLMClient, sequential: bool = False, max_concurrent: int = 50):
+        super().__init__(client)
+        self.sequential = sequential
+        self.max_concurrent = max_concurrent
+
+    async def run(
+        self,
+        extraction_prompts: List[List[Dict[str, str]]],
+        update_prompts: List[List[Dict[str, str]]],  # Ignored
+    ) -> StrategyResult:
+        start_time = time.perf_counter()
+
+        if self.sequential:
+            # Sequential execution
+            responses: List[LLMResponse] = []
+            for prompt_msgs in extraction_prompts:
+                response = await self.client.chat_completion(
+                    messages=prompt_msgs,
+                    response_format={"type": "json_object"},
+                )
+                responses.append(response)
+        else:
+            # Concurrent execution
+            responses = await self.client.batch_chat_completion(
+                messages_list=extraction_prompts,
+                response_format={"type": "json_object"},
+                max_concurrent=self.max_concurrent,
+            )
+
+        total_time = (time.perf_counter() - start_time) * 1000
+        mode = "sequential" if self.sequential else "concurrent"
+
+        return StrategyResult(
+            strategy_name=f"{self.name}_{mode}",
+            total_time_ms=total_time,
+            num_requests=len(extraction_prompts),
+            num_llm_calls=len(responses),
             total_input_tokens=sum(r.input_tokens for r in responses),
             total_output_tokens=sum(r.output_tokens for r in responses),
             latencies_ms=[r.latency_ms for r in responses],
@@ -188,219 +280,44 @@ class ConcurrentStrategy(BaseStrategy):
             errors=[r.error for r in responses if r.error],
         )
 
-    async def run_update(
-        self,
-        prompts: List[List[Dict[str, str]]],
-    ) -> StrategyResult:
-        return await self.run_extraction(prompts)
-
-
-class BatchedExtractionStrategy(BaseStrategy):
-    """
-    Batched extraction strategy: Combine multiple prompts into single requests.
-    Reduces token usage by sharing system prompts.
-    """
-
-    name = "batched_extraction"
-
-    def __init__(self, client: LLMClient, max_items_per_batch: int = 15):
-        super().__init__(client)
-        self.max_items_per_batch = max_items_per_batch
-
-    async def run_extraction(
-        self,
-        prompts: List[List[Dict[str, str]]],
-    ) -> StrategyResult:
-        start_time = time.perf_counter()
-
-        # Create batched prompts
-        batched_prompts = create_batched_extraction_prompt(
-            prompts,
-            max_items_per_batch=self.max_items_per_batch,
-        )
-
-        # Execute batched requests
-        responses: List[LLMResponse] = []
-        all_batch_results = []
-
-        for batched_prompt in batched_prompts:
-            response = await self.client.chat_completion(
-                messages=batched_prompt.messages,
-                response_format={"type": "json_object"},
-            )
-            responses.append(response)
-
-            # Parse batched response
-            batch_results = parse_batched_response(
-                response.content,
-                batched_prompt,
-            )
-            all_batch_results.append(batch_results)
-
-        # Unbatch results to original order
-        final_results = unbatch_results(all_batch_results, len(prompts))
-
-        total_time = (time.perf_counter() - start_time) * 1000
-
-        return StrategyResult(
-            strategy_name=self.name,
-            total_time_ms=total_time,
-            num_requests=len(prompts),
-            num_llm_calls=len(batched_prompts),
-            total_input_tokens=sum(r.input_tokens for r in responses),
-            total_output_tokens=sum(r.output_tokens for r in responses),
-            latencies_ms=[r.latency_ms for r in responses],
-            results=final_results,
-            errors=[r.error for r in responses if r.error],
-        )
-
-    async def run_update(
-        self,
-        prompts: List[List[Dict[str, str]]],
-    ) -> StrategyResult:
-        # Update phase runs sequentially (dependency on previous results)
-        sequential = SequentialStrategy(self.client)
-        result = await sequential.run_update(prompts)
-        result.strategy_name = f"{self.name}_update"
-        return result
-
-
-class SingleUserScenario:
-    """
-    Single user scenario: One user making multiple add requests.
-    Update phase must be sequential due to memory state dependencies.
-    """
-
-    def __init__(self, client: LLMClient):
-        self.client = client
-
-    async def run_sequential(
-        self,
-        extraction_prompts: List[List[Dict[str, str]]],
-        update_prompts: List[List[Dict[str, str]]],
-    ) -> Dict[str, StrategyResult]:
-        """Run with fully sequential approach."""
-        strategy = SequentialStrategy(self.client)
-
-        extraction_result = await strategy.run_extraction(extraction_prompts)
-        update_result = await strategy.run_update(update_prompts)
-
-        return {
-            "extraction": extraction_result,
-            "update": update_result,
-        }
-
-    async def run_batched_extraction(
-        self,
-        extraction_prompts: List[List[Dict[str, str]]],
-        update_prompts: List[List[Dict[str, str]]],
-    ) -> Dict[str, StrategyResult]:
-        """Run with batched extraction, sequential update."""
-        extraction_strategy = BatchedExtractionStrategy(self.client)
-        update_strategy = SequentialStrategy(self.client)
-
-        extraction_result = await extraction_strategy.run_extraction(extraction_prompts)
-        update_result = await update_strategy.run_update(update_prompts)
-
-        return {
-            "extraction": extraction_result,
-            "update": update_result,
-        }
-
-
-class MultiUserScenario:
-    """
-    Multi-user scenario: Multiple users making add requests concurrently.
-    Both extraction and update phases can be parallelized.
-    """
-
-    def __init__(self, client: LLMClient):
-        self.client = client
-
-    async def run_sequential(
-        self,
-        extraction_prompts: List[List[Dict[str, str]]],
-        update_prompts: List[List[Dict[str, str]]],
-    ) -> Dict[str, StrategyResult]:
-        """Run with fully sequential approach (baseline)."""
-        strategy = SequentialStrategy(self.client)
-
-        extraction_result = await strategy.run_extraction(extraction_prompts)
-        update_result = await strategy.run_update(update_prompts)
-
-        return {
-            "extraction": extraction_result,
-            "update": update_result,
-        }
-
-    async def run_full_concurrent(
-        self,
-        extraction_prompts: List[List[Dict[str, str]]],
-        update_prompts: List[List[Dict[str, str]]],
-    ) -> Dict[str, StrategyResult]:
-        """Run with full concurrency (both phases parallel)."""
-        strategy = ConcurrentStrategy(self.client)
-
-        extraction_result = await strategy.run_extraction(extraction_prompts)
-        update_result = await strategy.run_update(update_prompts)
-
-        return {
-            "extraction": extraction_result,
-            "update": update_result,
-        }
-
-    async def run_full_batched(
-        self,
-        extraction_prompts: List[List[Dict[str, str]]],
-        update_prompts: List[List[Dict[str, str]]],
-    ) -> Dict[str, StrategyResult]:
-        """Run with batched extraction and concurrent update."""
-        extraction_strategy = BatchedExtractionStrategy(self.client)
-        update_strategy = ConcurrentStrategy(self.client)
-
-        extraction_result = await extraction_strategy.run_extraction(extraction_prompts)
-        update_result = await update_strategy.run_update(update_prompts)
-
-        return {
-            "extraction": extraction_result,
-            "update": update_result,
-        }
-
 
 def compare_results(
-    baseline: Dict[str, StrategyResult],
-    optimized: Dict[str, StrategyResult],
-    baseline_name: str = "Sequential",
-    optimized_name: str = "Optimized",
+    baseline: StrategyResult,
+    optimized: StrategyResult,
 ) -> str:
     """Generate comparison report between two strategy results."""
 
-    baseline_total = baseline["extraction"].total_time_ms + baseline["update"].total_time_ms
-    optimized_total = optimized["extraction"].total_time_ms + optimized["update"].total_time_ms
+    speedup = baseline.total_time_ms / optimized.total_time_ms if optimized.total_time_ms > 0 else 0
+    token_diff = optimized.total_tokens - baseline.total_tokens
+    token_pct = (token_diff / baseline.total_tokens) * 100 if baseline.total_tokens > 0 else 0
 
-    baseline_tokens = baseline["extraction"].total_tokens + baseline["update"].total_tokens
-    optimized_tokens = optimized["extraction"].total_tokens + optimized["update"].total_tokens
-
-    speedup = baseline_total / optimized_total if optimized_total > 0 else 0
-    token_savings = (1 - optimized_tokens / baseline_tokens) * 100 if baseline_tokens > 0 else 0
+    cache_comparison = ""
+    if baseline.cache_hit_rate is not None and optimized.cache_hit_rate is not None:
+        cache_diff = optimized.cache_hit_rate - baseline.cache_hit_rate
+        cache_comparison = f"""
+Cache Hit Rate:
+  {baseline.strategy_name}:   {baseline.cache_hit_rate:.1f}%
+  {optimized.strategy_name}:  {optimized.cache_hit_rate:.1f}%
+  Improvement:        +{cache_diff:.1f}%
+"""
 
     return f"""
-Comparison: {baseline_name} vs {optimized_name}
+Comparison: {baseline.strategy_name} vs {optimized.strategy_name}
 {"=" * 60}
 
 Time:
-  {baseline_name}:   {baseline_total:.1f} ms
-  {optimized_name}:  {optimized_total:.1f} ms
-  Speedup:           {speedup:.2f}x
+  {baseline.strategy_name}:   {baseline.total_time_ms:.1f} ms ({baseline.total_time_ms / 1000:.2f} s)
+  {optimized.strategy_name}:  {optimized.total_time_ms:.1f} ms ({optimized.total_time_ms / 1000:.2f} s)
+  Speedup:            {speedup:.2f}x
 
 LLM Calls:
-  {baseline_name}:   {baseline["extraction"].num_llm_calls + baseline["update"].num_llm_calls}
-  {optimized_name}:  {optimized["extraction"].num_llm_calls + optimized["update"].num_llm_calls}
+  {baseline.strategy_name}:   {baseline.num_llm_calls}
+  {optimized.strategy_name}:  {optimized.num_llm_calls}
 
 Tokens:
-  {baseline_name}:   {baseline_tokens:,}
-  {optimized_name}:  {optimized_tokens:,}
-  Savings:           {token_savings:.1f}%
-
+  {baseline.strategy_name}:   {baseline.total_tokens:,}
+  {optimized.strategy_name}:  {optimized.total_tokens:,}
+  Difference:         {token_diff:+,} ({token_pct:+.1f}%)
+{cache_comparison}
 {"=" * 60}
 """

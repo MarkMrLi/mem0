@@ -1,213 +1,200 @@
 # Mem0 Add 阶段 Batch LLM 调用性能验证 MVP
 
+## 目标
+
+验证在 mem0 的 `add` 操作中，通过优化 LLM 调用调度，利用 vLLM 的 **prefix caching** 机制带来的性能提升。
+
 ## 背景
-
-在多并发场景下，Mem0 的 `add` 操作需要频繁调用 LLM。本项目旨在验证通过 batch 合并 LLM 调用，能够带来多少性能提升和成本减少。
-
-## 问题分析
 
 ### Mem0 Add 操作流程
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Mem0 Add 操作流程                              │
-├─────────────────────────────────────────────────────────────────┤
-│  Input: N 条消息 (来自 N 次 add 调用)                             │
-│                                                                   │
-│  ┌──────────────────┐    ┌──────────────────────────────────┐   │
-│  │ LLM Call 1       │    │ LLM Call 2                       │   │
-│  │ Fact Extraction  │ -> │ Memory Update Decision           │   │
-│  │ (独立，可并行)     │    │ (依赖已有 memory 状态)            │   │
-│  └──────────────────┘    └──────────────────────────────────┘   │
-│                                                                   │
-│  原始：N 次 extraction + N 次 update = 2N 次串行 LLM 调用        │
-│  优化后：                                                         │
-│    - 同用户：1 batch extraction + N 次串行 update                │
-│    - 多用户：1 batch extraction + 1 batch update (完全并行)      │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 数据特征 (来自 prompts_storage.json)
-
-| 阶段 | 数量 | System Prompt | 特征 |
-|------|------|---------------|------|
-| Extraction | 100 | 1 个共享 (~2000 tokens) | 仅 user content 不同，可以高效 batch |
-| Update | 78 | 无 system prompt | 包含动态 memory 状态，依赖前序结果 |
-
-## 优化策略对比
+每次 `add` 操作包含两次 LLM 调用：
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│ 策略对比                                                                 │
-├─────────────┬──────────────────────┬───────────────────────────────────┤
-│ 策略        │ Extraction           │ Update                            │
-├─────────────┼──────────────────────┼───────────────────────────────────┤
-│ Sequential  │ N 次独立请求          │ N 次独立请求 (每次依赖前一次结果)  │
-│             │ ↓ N × system prompt  │ ↓ 必须串行                         │
-├─────────────┼──────────────────────┼───────────────────────────────────┤
-│ Concurrent  │ N 次并发请求          │ 单用户: 串行 / 多用户: 并发        │
-│ (asyncio)   │ (vLLM 自动 batch)    │ ↓ vLLM 自动 batch                 │
-├─────────────┼──────────────────────┼───────────────────────────────────┤
-│ Prompt      │ 1 次请求             │ 保持原样                           │
-│ Batching    │ 合并多个 user input  │ ↓ 无法合并 (每个有不同 context)    │
-│             │ ↓ 1 × system prompt  │                                    │
-└─────────────┴──────────────────────┴───────────────────────────────────┘
+┌─────────────────┐     ┌─────────────────┐
+│   Extraction    │ --> │     Update      │
+│ (提取 facts)    │     │ (更新 memory)   │
+└─────────────────┘     └─────────────────┘
 ```
 
-## MVP 设计
+### 问题
 
-### 文件结构
+原生 mem0 行为是**完全串行**的：
+
+```
+E1 → U1 → E2 → U2 → E3 → U3 → ...
+```
+
+这种模式下，共享 system prompt 的 Extraction 请求被其他类型的请求（Update）隔开，导致 vLLM 的 prefix cache 无法有效利用。
+
+### 优化方案
+
+通过**按阶段批量调度**，让共享 prefix 的请求连续执行：
+
+```
+[E1, E2, E3, ...] → [U1, U2, U3, ...]
+```
+
+## 测试场景设计
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           测试场景对比                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  基线 (mem0 原生行为):                                                       │
+│  ┌────┐   ┌────┐   ┌────┐   ┌────┐   ┌────┐   ┌────┐                       │
+│  │ E1 │──▶│ U1 │──▶│ E2 │──▶│ U2 │──▶│ E3 │──▶│ U3 │──▶ ...               │
+│  └────┘   └────┘   └────┘   └────┘   └────┘   └────┘                       │
+│     └── 完全串行，prefix cache 无法有效利用 ──┘                              │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  优化1 (并发 HTTP 请求):                                                     │
+│  ┌────┬────┬────┐         ┌────┬────┬────┐                                 │
+│  │ E1 │ E2 │ E3 │ ──────▶ │ U1 │ U2 │ U3 │                                 │
+│  └────┴────┴────┘         └────┴────┴────┘                                 │
+│     └── 按阶段批量，vLLM 自动 batch + prefix cache ──┘                       │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  优化2 (离线 LLM.generate()):                                                │
+│  ┌─────────────────────┐    ┌─────────────────────┐                        │
+│  │ LLM.generate(       │    │ LLM.generate(       │                        │
+│  │   [E1, E2, E3, ...] │───▶│   [U1, U2, U3, ...] │                        │
+│  │ )                   │    │ )                   │                        │
+│  └─────────────────────┘    └─────────────────────┘                        │
+│     └── 离线批量推理，最优性能 ──┘                                           │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 测试策略
+
+| 策略 | 模式 | 说明 |
+|------|------|------|
+| `mem0_native` | E1→U1→E2→U2→... | 基线，模拟 mem0 原生串行行为 |
+| `concurrent_http` | [E1,E2,...] → [U1,U2,...] | 并发 HTTP 请求，按阶段批量 |
+| `offline_batch` | LLM.generate() | 离线批量推理（服务器端运行） |
+
+## 文件结构
 
 ```
 server/batch_benchmark/
 ├── .env.example           # 配置模板
-├── config.py              # 加载 .env 配置
+├── config.py              # 环境变量加载
 ├── llm_client.py          # Async OpenAI 客户端
-├── token_analyzer.py      # Token 成本分析 (使用 tiktoken)
-├── prompt_batcher.py      # Prompt 合并逻辑
+├── token_analyzer.py      # Token 成本分析
 ├── strategies.py          # 测试策略实现
-├── benchmark.py           # 主入口
+├── benchmark.py           # 主入口（HTTP 方式）
+├── offline_batch.py       # 离线批量推理（服务器端）
+├── vllm_metrics.py        # vLLM metrics 解析
 └── README.md              # 本文件
 ```
 
-### 测试策略
+## 快速开始
 
-| 策略名称 | Extraction | Update | 适用场景 |
-|---------|------------|--------|---------|
-| `sequential` | 串行 N 次 | 串行 N 次 | 基线 |
-| `concurrent_extraction` | 并发 N 次 | 串行 N 次 | 单用户 |
-| `batched_extraction` | 合并 1 次 | 串行 N 次 | 单用户 (省 token) |
-| `full_concurrent` | 并发 N 次 | 并发 N 次 | 多用户 |
-| `full_batched` | 合并 1 次 | 并发/合并 | 多用户 (省 token) |
-
-### Prompt 合并策略
-
-#### 原始格式 (N 个独立请求)
-
-```json
-[
-    {"role": "system", "content": "<2000 tokens system prompt>"},
-    {"role": "user", "content": "Input: <conversation 1>"}
-]
-[
-    {"role": "system", "content": "<2000 tokens system prompt>"},
-    {"role": "user", "content": "Input: <conversation 2>"}
-]
-```
-
-#### 合并后格式 (1 个请求)
-
-```json
-[
-    {"role": "system", "content": "<2000 tokens system prompt + 批量处理指令>"},
-    {"role": "user", "content": "Process the following items:\n\n[Item 1]:\n<conversation 1>\n\n[Item 2]:\n<conversation 2>"}
-]
-```
-
-#### 输出格式
-
-```json
-{
-    "results": [
-        {"item_id": 1, "facts": ["fact1", "fact2"]},
-        {"item_id": 2, "facts": ["fact3"]}
-    ]
-}
-```
-
-## 测试流程
-
-### Phase 1: Token 分析 (无需调用 LLM)
-
-- 计算 sequential 总 token 数
-- 计算 batched 总 token 数
-- 输出节省比例
-
-### Phase 2: 模拟测试 (验证逻辑正确性)
-
-- 使用固定延迟模拟 LLM 调用
-- 验证 prompt 合并逻辑
-- 验证结果解析逻辑
-
-### Phase 3: 实际调用测试 (测性能)
-
-- Sequential baseline
-- Concurrent (vLLM auto-batch)
-- Prompt batching
-- 生成对比报告
-
-## 预期成本节省
-
-基于 `prompts_storage.json` 的数据 (15 个请求)：
-
-| 项目 | Sequential | Batched | 节省 |
-|------|-----------|---------|------|
-| System Prompt | 15 × ~2000 = 30,000 | 1 × ~2100 = 2,100 | **93%** |
-| User Content | 15 × ~100 = 1,500 | 1 × ~1,600 = 1,600 | -7% |
-| **Total Input** | **31,500** | **3,700** | **88%** |
-
-## 预期结果
-
-### 场景 1: 单用户 (10 adds, sequential update phase)
-
-| Strategy | Time (s) | Speedup | Calls |
-|----------|----------|---------|-------|
-| Sequential | 25.3 | 1.00x | 20 |
-| Concurrent Extraction | 14.2 | 1.78x | 11 |
-| Batched Extraction | 12.5 | 2.02x | 11 |
-
-### 场景 2: 多用户 (10 adds, parallel update phase)
-
-| Strategy | Time (s) | Speedup | Calls |
-|----------|----------|---------|-------|
-| Sequential | 24.8 | 1.00x | 20 |
-| Full Concurrent | 6.1 | 4.07x | 2 |
-| Full Batched | 5.2 | 4.77x | 2 |
-
-## 配置
-
-复制 `.env.example` 为 `.env` 并配置：
+### 1. 配置
 
 ```bash
+cd server/batch_benchmark
 cp .env.example .env
+# 编辑 .env 设置你的 vLLM 服务地址
 ```
 
-配置项：
-
-```
-VLLM_BASE_URL=http://localhost:8000/v1
-VLLM_API_KEY=EMPTY
-VLLM_MODEL=your-model-name
-```
-
-## 运行
+### 2. 运行 HTTP 方式 Benchmark
 
 ```bash
-# 仅运行 Token 分析 (不需要 LLM)
-python benchmark.py --phase token
+# 运行所有策略对比
+python benchmark.py --strategy all --num-requests 20
 
-# 运行模拟测试
-python benchmark.py --phase mock
+# 只运行 mem0_native 基线
+python benchmark.py --strategy mem0_native --num-requests 10
 
-# 运行完整测试
-python benchmark.py --phase full
+# 只运行 concurrent_http 优化
+python benchmark.py --strategy concurrent_http --num-requests 10
 
-# 指定测试规模
-python benchmark.py --num-requests 15
+# 只测试 extraction 阶段（更好地隔离 prefix cache 效果）
+python benchmark.py --mode extraction-only --num-requests 20
 ```
 
-## 关键技术点
+### 3. 运行离线批量 Benchmark（服务器端）
 
-1. **Prompt 合并格式**：需要修改 system prompt 添加批量处理指令，并设计 item 分隔符
-2. **结果解析**：从单个 JSON 响应中提取多个结果
-3. **错误处理**：单个 item 失败不影响其他 item
-4. **Update 阶段依赖**：单用户场景下必须串行
+```bash
+# 在 vLLM 服务器上运行
+python offline_batch.py \
+    --model /home/llz/model/qwen3-30b-a3b-instruct-2507 \
+    --prompts ../prompts_storage.json \
+    --num-requests 20 \
+    --mode compare
+```
+
+## 输出示例
+
+```
+Strategy Comparison (N=20 requests)
+══════════════════════════════════════════════════════════════
+Strategy          │ Time (s) │ Cache Hit % │ Speedup │ Tokens
+──────────────────┼──────────┼─────────────┼─────────┼────────
+mem0_native       │   45.2   │    ~30%     │  1.00x  │ 120,000
+concurrent_http   │   12.5   │    ~85%     │  3.6x   │ 120,000
+──────────────────────────────────────────────────────────────
+```
+
+## 关键指标
+
+1. **总执行时间**: 端到端完成所有请求的时间
+2. **Cache Hit Rate**: vLLM prefix cache 命中率（从 `/metrics` 端点获取）
+3. **Speedup**: 相对于基线的加速比
+
+## vLLM Metrics
+
+Benchmark 自动从 vLLM 的 `/metrics` 端点获取 prefix cache 统计：
+
+```
+vllm:prefix_cache_queries_total  # 查询的 token 数
+vllm:prefix_cache_hits_total     # 命中的 token 数
+```
+
+Cache Hit Rate = hits / queries × 100%
+
+## 配置选项
+
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `VLLM_BASE_URL` | `http://localhost:8000/v1` | vLLM API 地址 |
+| `VLLM_API_KEY` | `EMPTY` | API Key |
+| `VLLM_MODEL` | - | 模型路径 |
+| `VLLM_METRICS_URL` | 从 BASE_URL 推导 | Metrics 端点地址 |
+| `VLLM_METRICS_ENABLED` | `true` | 是否启用 metrics 采集 |
 
 ## 依赖
 
 ```
 openai>=1.0.0
-tiktoken
+httpx
 python-dotenv
-asyncio
+tiktoken  # 可选，用于 token 分析
 ```
+
+离线批量模式额外需要：
+```
+vllm
+transformers
+```
+
+## 预期结果
+
+基于 extraction prompts 共享 ~2000 tokens 的 system prompt：
+
+| 场景 | mem0_native Cache Hit | concurrent_http Cache Hit | 预期加速 |
+|------|----------------------|---------------------------|---------|
+| 10 请求 | ~20-30% | ~80-90% | 2-3x |
+| 20 请求 | ~15-25% | ~85-95% | 3-4x |
+| 50 请求 | ~10-20% | ~90-95% | 4-5x |
+
+实际结果取决于：
+- vLLM 版本和配置
+- GPU 显存和 KV cache 大小
+- 并发请求数量
+- 请求到达间隔

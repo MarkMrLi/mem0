@@ -42,6 +42,14 @@ class BenchmarkConfig:
     prompts_file: str = "../prompts_storage.json"
 
 
+@dataclass
+class VLLMMetricsConfig:
+    """vLLM metrics endpoint configuration."""
+
+    metrics_url: str
+    enabled: bool = True
+
+
 def get_llm_config() -> LLMConfig:
     """Load LLM configuration from environment variables."""
     return LLMConfig(
@@ -58,6 +66,27 @@ def get_benchmark_config() -> BenchmarkConfig:
         num_requests=int(os.getenv("BENCHMARK_NUM_REQUESTS", "15")),
         timeout=int(os.getenv("BENCHMARK_TIMEOUT", "120")),
         prompts_file=os.getenv("PROMPTS_FILE", str(Path(__file__).parent.parent / "prompts_storage.json")),
+    )
+
+
+def get_vllm_metrics_config() -> VLLMMetricsConfig:
+    """Load vLLM metrics configuration from environment variables."""
+    metrics_url = os.getenv("VLLM_METRICS_URL", "")
+
+    # If not explicitly set, derive from base URL
+    if not metrics_url:
+        base_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
+        # Remove /v1 suffix and add /metrics
+        if base_url.endswith("/v1"):
+            metrics_url = base_url[:-3] + "/metrics"
+        else:
+            metrics_url = base_url.rstrip("/") + "/metrics"
+
+    enabled = os.getenv("VLLM_METRICS_ENABLED", "true").lower() in ("true", "1", "yes")
+
+    return VLLMMetricsConfig(
+        metrics_url=metrics_url,
+        enabled=enabled,
     )
 
 
