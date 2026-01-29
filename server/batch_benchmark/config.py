@@ -15,9 +15,12 @@ try:
     # Load .env from the same directory as this file
     env_path = Path(__file__).parent / ".env"
     if env_path.exists():
-        load_dotenv(env_path)
+        load_dotenv(env_path, override=True)
+        print(f"Loaded .env from: {env_path}")
+    else:
+        print(f"Warning: .env file not found at {env_path}")
 except ImportError:
-    pass
+    print("Warning: python-dotenv not installed. Install with: pip install python-dotenv")
 
 
 @dataclass

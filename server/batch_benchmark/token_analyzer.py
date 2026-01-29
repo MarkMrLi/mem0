@@ -74,7 +74,7 @@ def load_prompts(prompts_file: str) -> Tuple[List[Any], List[Any]]:
     Returns:
         Tuple of (extraction_prompts, update_prompts)
     """
-    with open(prompts_file, "r") as f:
+    with open(prompts_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     return data.get("extraction_prompts", []), data.get("update_prompts", [])
