@@ -3,6 +3,7 @@ import os
 import time
 from collections import defaultdict
 
+import tiktoken
 from dotenv import load_dotenv
 from jinja2 import Template
 from openai import OpenAI
@@ -26,10 +27,23 @@ class FullContextProcessor:
         self.model = os.getenv("MODEL")
         self.client = OpenAI(base_url=os.getenv("VLLM_BASE_URL"))
         self.data_path = data_path
+        
+        # 初始化tokenizer用于token计数
+        try:
+            # 尝试使用指定的模型
+            self.tokenizer = tiktoken.encoding_for_model(self.model)
+        except KeyError:
+            # 如果模型不在tiktoken中，使用默认的cl100k_base编码
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
 
     def generate_response(self, question, context):
         template = Template(FULL_CONTEXT_PROMPT)
         prompt = template.render(CONTEXT=context, QUESTION=question)
+
+        # 计算输入token数量
+        system_message = "You are a helpful assistant that can answer questions based on the provided complete conversation context.If the question involves timing, use the conversation date for reference.Provide the shortest possible answer.Use words directly from the conversation when possible.Avoid using subjects in your answer."
+        
+        input_tokens = len(self.tokenizer.encode(system_message)) + len(self.tokenizer.encode(prompt))
 
         max_retries = 3
         retries = 0
@@ -55,7 +69,33 @@ class FullContextProcessor:
                     max_tokens=1000
                 )
                 t2 = time.time()
-                return response.choices[0].message.content.strip(), t2 - t1
+                
+                # 计算输出token数量
+                output_content = response.choices[0].message.content.strip()
+                output_tokens = len(self.tokenizer.encode(output_content))
+                
+                # 获取实际的API返回的token使用情况（如果可用）
+                api_usage = getattr(response, 'usage', None)
+                if api_usage:
+                    actual_input_tokens = api_usage.prompt_tokens
+                    actual_output_tokens = api_usage.completion_tokens
+                    total_tokens = api_usage.total_tokens
+                else:
+                    actual_input_tokens = input_tokens
+                    actual_output_tokens = output_tokens
+                    total_tokens = input_tokens + output_tokens
+                
+                return (
+                    output_content, 
+                    t2 - t1,
+                    {
+                        "input_tokens": actual_input_tokens,
+                        "output_tokens": actual_output_tokens,
+                        "total_tokens": total_tokens,
+                        "estimated_input_tokens": input_tokens,
+                        "estimated_output_tokens": output_tokens
+                    }
+                )
             except Exception as e:
                 retries += 1
                 if retries > max_retries:
@@ -147,7 +187,7 @@ class FullContextProcessor:
                 category = item.get("category", "")
                 
                 # Generate response using full context
-                response, response_time = self.generate_response(question, full_context)
+                response, response_time, token_info = self.generate_response(question, full_context)
 
                 FINAL_RESULTS[key].append(
                     {
@@ -157,6 +197,15 @@ class FullContextProcessor:
                         "context": full_context[:100],  # Include full context for reference
                         "response": response,
                         "response_time": response_time,
+                        # Token使用信息
+                        "input_tokens": token_info["input_tokens"],
+                        "output_tokens": token_info["output_tokens"],
+                        "total_tokens": token_info["total_tokens"],
+                        "estimated_input_tokens": token_info["estimated_input_tokens"],
+                        "estimated_output_tokens": token_info["estimated_output_tokens"],
+                        # 上下文长度信息
+                        "context_length": len(full_context),
+                        "context_chars": len(full_context)
                     }
                 )
                 
@@ -168,4 +217,52 @@ class FullContextProcessor:
         with open(output_file_path, "w") as f:
             json.dump(FINAL_RESULTS, f, indent=4)
         
+        # 生成token使用统计
+        self._print_token_statistics(FINAL_RESULTS)
+        
         print(f"✅ Full context processing complete. Results saved to {output_file_path}")
+
+    def _print_token_statistics(self, results):
+        """打印token使用统计信息"""
+        print("\n" + "=" * 50)
+        print("📊 Token使用统计")
+        print("=" * 50)
+        
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_tokens = 0
+        total_context_chars = 0
+        question_count = 0
+        
+        for conv_id, questions in results.items():
+            for qa in questions:
+                total_input_tokens += qa.get("input_tokens", 0)
+                total_output_tokens += qa.get("output_tokens", 0)
+                total_tokens += qa.get("total_tokens", 0)
+                total_context_chars += qa.get("context_chars", 0)
+                question_count += 1
+        
+        if question_count == 0:
+            print("❌ 没有找到任何问题")
+            return
+        
+        avg_input_tokens = total_input_tokens / question_count
+        avg_output_tokens = total_output_tokens / question_count
+        avg_total_tokens = total_tokens / question_count
+        avg_context_chars = total_context_chars / question_count
+        
+        print(f"📈 总问题数: {question_count}")
+        print(f"🔤 总输入tokens: {total_input_tokens:,}")
+        print(f"🔤 总输出tokens: {total_output_tokens:,}")
+        print(f"🔤 总tokens: {total_tokens:,}")
+        print(f"📝 平均输入tokens: {avg_input_tokens:.1f}")
+        print(f"📝 平均输出tokens: {avg_output_tokens:.1f}")
+        print(f"📝 平均总tokens: {avg_total_tokens:.1f}")
+        print(f"📄 平均上下文字符数: {avg_context_chars:.1f}")
+        
+        # 计算字符到token的比例
+        if avg_context_chars > 0 and avg_input_tokens > 0:
+            chars_per_token = avg_context_chars / avg_input_tokens
+            print(f"📊 字符/token比例: {chars_per_token:.2f}")
+        
+        print("=" * 50)
